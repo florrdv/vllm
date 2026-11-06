@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
-from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -24,7 +23,6 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.replayssm_utils import (
     ReplaySSMModelContext,
     _reinterpret_u64_as_i64,
@@ -650,40 +648,6 @@ def precopy_mamba_align_fused_kernel(
     )
 
 
-@triton.jit
-def batch_memcpy_kernel(src_ptrs, dst_ptrs, sizes, BLOCK_SIZE: tl.constexpr):
-    pid = tl.program_id(0)
-
-    src_ptr = tl.load(src_ptrs + pid)
-    dst_ptr = tl.load(dst_ptrs + pid)
-    size = tl.load(sizes + pid)
-    is_left_overlap = dst_ptr < src_ptr and dst_ptr + size > src_ptr
-
-    offsets = tl.arange(0, BLOCK_SIZE)
-    for i in range(0, size, BLOCK_SIZE):
-        mask = (i + offsets) < size
-
-        curr_src_ptr = (src_ptr + i + offsets).to(tl.pointer_type(tl.uint8))
-        curr_dst_ptr = (dst_ptr + i + offsets).to(tl.pointer_type(tl.uint8))
-
-        data = tl.load(curr_src_ptr, mask=mask)
-        if is_left_overlap:
-            # Preserve each lane's source before a lower-address lane stores
-            # over it. The condition is uniform within the program.
-            tl.debug_barrier()
-        tl.store(curr_dst_ptr, data, mask=mask)
-
-
-def batch_memcpy(src_ptrs, dst_ptrs, sizes):
-    batch = src_ptrs.shape[0]
-    assert dst_ptrs.shape[0] == batch
-    assert sizes.shape[0] == batch
-
-    grid = (batch,)
-    BLOCK_SIZE = 1024
-    batch_memcpy_kernel[grid](src_ptrs, dst_ptrs, sizes, BLOCK_SIZE=BLOCK_SIZE)
-
-
 def _get_mamba_spec_for_layer(
     kv_cache_group: KVCacheGroupSpec, layer_name: str
 ) -> MambaSpec:
@@ -808,18 +772,6 @@ class MambaSpecDecodeGPUContext:
     # shape: [num_groups, max_num_reqs, 1 + num_speculative_blocks].
     aligned_state_indices: torch.Tensor | None = None
 
-    # Per-request staging buffers (CPU+GPU mirrors). The runner stages
-    # values into the CPU view in ``_prepare_inputs`` and the fused kernel
-    # reads the GPU side. These only exist when the postprocess kernel is
-    # enabled (spec decode + hybrid, or FlashInfer ReplaySSM prefix caching).
-    mamba_state_idx_buf: CpuGpuBuffer | None = None
-    num_scheduled_tokens_buf: CpuGpuBuffer | None = None
-    num_computed_tokens_buf: CpuGpuBuffer | None = None
-    num_draft_tokens_buf: CpuGpuBuffer | None = None
-    is_prefilling_buf: CpuGpuBuffer | None = None
-    precopy_src_col_buf: CpuGpuBuffer | None = None
-    precopy_token_bias_buf: CpuGpuBuffer | None = None
-
     # Flag to track if metadata has been populated
     is_initialized: bool = False
     # Persistent all-layer ReplaySSM descriptors, populated with the cache
@@ -834,7 +786,6 @@ class MambaSpecDecodeGPUContext:
         copy_funcs: MambaStateCopyFuncsByType,
         forward_context: dict[str, Any],
         device: torch.device,
-        make_buffer: Callable[..., CpuGpuBuffer],
     ) -> "MambaSpecDecodeGPUContext":
         """Create context with allocated buffers (metadata populated later)."""
         mamba_groups = get_mamba_groups(kv_cache_config)
@@ -909,13 +860,6 @@ class MambaSpecDecodeGPUContext:
                 dtype=torch.int32,
                 device=device,
             ),
-            mamba_state_idx_buf=make_buffer(max_num_reqs, dtype=torch.int32),
-            num_scheduled_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
-            num_computed_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
-            num_draft_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
-            is_prefilling_buf=make_buffer(max_num_reqs, dtype=torch.bool),
-            precopy_src_col_buf=make_buffer(max_num_reqs, dtype=torch.int32),
-            precopy_token_bias_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             is_initialized=False,
             replayssm=None,
         )
@@ -1177,65 +1121,6 @@ class MambaSpecDecodeGPUContext:
             num_warps=1,
         )
         return self.aligned_state_indices[:, :num_reqs]
-
-    def run_fused_postprocess(
-        self,
-        num_reqs: int,
-        num_accepted_tokens_gpu: torch.Tensor,
-        mamba_state_idx_gpu: torch.Tensor,
-        num_scheduled_tokens_gpu: torch.Tensor,
-        num_computed_tokens_gpu: torch.Tensor,
-        num_draft_tokens_gpu: torch.Tensor,
-    ) -> None:
-        """Run the fused postprocess_mamba kernel on GPU.
-
-        This computes decisions and performs mamba state copies entirely on GPU,
-        eliminating the CPU-GPU sync that was previously needed.
-
-        Args:
-            num_reqs: Number of active requests
-            num_accepted_tokens_gpu: [num_reqs] accepted token counts
-            mamba_state_idx_gpu: [num_reqs] source block indices
-            num_scheduled_tokens_gpu: [num_reqs] scheduled token counts
-            num_computed_tokens_gpu: [num_reqs] computed token counts
-            num_draft_tokens_gpu: [num_reqs] draft token counts
-
-        """
-        if num_reqs == 0 or not self.is_initialized:
-            return
-
-        self.num_accepted_tokens_snapshot[:num_reqs].copy_(
-            num_accepted_tokens_gpu[:num_reqs]
-        )
-
-        total_states = self.num_states
-        grid = (num_reqs, total_states, _TEMPORAL_TILES)
-
-        postprocess_mamba_fused_kernel[grid](
-            self.num_accepted_tokens_snapshot,
-            mamba_state_idx_gpu,
-            num_scheduled_tokens_gpu,
-            num_computed_tokens_gpu,
-            num_draft_tokens_gpu,
-            self.block_table_ptrs,
-            self.block_table_stride_req,
-            self.state_base_addrs,
-            self.state_block_strides,
-            self.state_elem_sizes,
-            self.state_inner_sizes,
-            self.state_conv_widths,
-            self.state_group_indices,
-            self.state_dim_row_count,
-            self.state_dim_row_stride,
-            num_accepted_tokens_gpu,
-            None,  # idx_mapping: V1 decision arrays are already in req order
-            num_reqs,
-            block_size=self.block_size,
-            COPY_BLOCK_SIZE=1024,
-            CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
-            SKIP_TEMPORAL_STATE_COPY=self.replayssm is not None,
-            TEMPORAL_TILES=_TEMPORAL_TILES,
-        )
 
     def run_fused_precopy(
         self,
