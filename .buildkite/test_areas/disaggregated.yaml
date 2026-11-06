@@ -346,7 +346,6 @@ steps: []
 #   num_devices: 2
 #   source_file_dependencies:
 #     - vllm/distributed/kv_transfer/kv_connector/v1/nixl/
-#     - vllm/v1/worker/kv_connector_model_runner_mixin.py
 #     - tests/v1/kv_connector/nixl_integration/
 #   commands:
 #     - bash /vllm-workspace/.buildkite/scripts/install-kv-connectors.sh
@@ -361,7 +360,6 @@ steps: []
 #         - image-build-amd
 #       source_file_dependencies:
 #         - vllm/distributed/kv_transfer/kv_connector/v1/nixl/
-#         - vllm/v1/worker/kv_connector_model_runner_mixin.py
 #         - tests/v1/kv_connector/nixl_integration/
 #         - vllm/platforms/rocm.py
 #       commands:
