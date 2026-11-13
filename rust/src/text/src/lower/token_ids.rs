@@ -29,6 +29,10 @@ pub enum TokenIdsError {
     TooManyTokenizedBadWords { count: usize, max: usize },
     #[error("Too many total bad word tokens: {count}. The max is {max}.")]
     TooManyBadWordTokens { count: usize, max: usize },
+    #[error("Too many allowed token IDs: {count}. The max size is {max}.")]
+    TooManyAllowedTokenIds { count: usize, max: usize },
+    #[error("Too many logit bias tokens: {count}. The max size is {max}.")]
+    TooManyLogitBiasTokens { count: usize, max: usize },
     #[error(
         "token_id(s) {token_ids:?} in {parameter} are out of vocabulary. \
          Vocabulary size: {vocab_size}"
@@ -119,6 +123,10 @@ pub(crate) fn validate_vocab_range(
         if token_ids.is_empty() {
             return Err(TokenIdsError::EmptyAllowedTokenIds);
         }
+        let (count, max) = (token_ids.len(), SamplingLimits::MAX_ALLOWED_TOKEN_IDS);
+        if count > max {
+            return Err(TokenIdsError::TooManyAllowedTokenIds { count, max });
+        }
         validate_param(
             "allowed_token_ids",
             token_ids.iter().copied(),
@@ -127,6 +135,10 @@ pub(crate) fn validate_vocab_range(
     }
 
     if let Some(logit_bias) = params.logit_bias.as_ref() {
+        let (count, max) = (logit_bias.len(), SamplingLimits::MAX_LOGIT_BIAS_TOKENS);
+        if count > max {
+            return Err(TokenIdsError::TooManyLogitBiasTokens { count, max });
+        }
         validate_param(
             "logit_bias",
             logit_bias.keys().copied(),
@@ -173,5 +185,35 @@ mod tests {
                 vocab_size: 1000,
             } if token_ids == vec![1000, 1001]
         ));
+    }
+
+    /// The worker raises inside `EngineCore` past these sizes, so they must be
+    /// rejected here.
+    #[test]
+    fn validate_vocab_range_enforces_sampler_buffer_limits() {
+        let limits = SamplingLimits {
+            max_model_len: 4096,
+            max_logprobs: SamplingLimits::DEFAULT_MAX_LOGPROBS,
+            model_vocab_size: 4096,
+            tokenizer_vocab_size: 4096,
+        };
+        let validate = |num_allowed: Option<u32>, num_logit_bias: Option<u32>| {
+            let params = EngineCoreSamplingParams {
+                allowed_token_ids: num_allowed.map(|n| (0..n).collect()),
+                logit_bias: num_logit_bias.map(|n| (0..n).map(|id| (id, 1.0)).collect()),
+                ..EngineCoreSamplingParams::for_test()
+            };
+            validate_vocab_range(&params, &limits).map_err(|error| error.to_string())
+        };
+
+        assert_eq!(validate(Some(1024), Some(1024)), Ok(()));
+        assert_eq!(
+            validate(Some(1025), None),
+            Err("Too many allowed token IDs: 1025. The max size is 1024.".to_string())
+        );
+        assert_eq!(
+            validate(None, Some(1025)),
+            Err("Too many logit bias tokens: 1025. The max size is 1024.".to_string())
+        );
     }
 }

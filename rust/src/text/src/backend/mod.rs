@@ -95,6 +95,12 @@ impl SamplingLimits {
     /// Original Python definition:
     /// <https://github.com/vllm-project/vllm/blob/b5adb027ad03c29b46181752ba3b1cb84eff1dd4/vllm/sampling_params.py#L30-L32>
     pub const MAX_LOGPROB_TOKEN_IDS: usize = 128;
+    /// Per-request `allowed_token_ids` buffer size of the GPU and CPU workers:
+    /// <https://github.com/vllm-project/vllm/blob/5302d1fe40e6969b854e0ab288d34825653767c6/vllm/v1/worker/gpu/sample/logit_bias.py#L20>
+    pub const MAX_ALLOWED_TOKEN_IDS: usize = 1024;
+    /// Per-request `logit_bias` buffer size of the GPU and CPU workers:
+    /// <https://github.com/vllm-project/vllm/blob/5302d1fe40e6969b854e0ab288d34825653767c6/vllm/v1/worker/gpu/sample/logit_bias.py#L21>
+    pub const MAX_LOGIT_BIAS_TOKENS: usize = 1024;
 
     /// Return the union bound used to validate token-ID prompts.
     pub fn prompt_token_vocab_size(&self) -> usize {

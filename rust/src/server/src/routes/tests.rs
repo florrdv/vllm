@@ -3797,6 +3797,43 @@ async fn chat_completions_empty_allowed_token_ids_returns_openai_error() {
     );
 }
 
+/// More `logit_bias` entries than the worker's per-request buffer is a 400.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn chat_completions_too_many_logit_bias_tokens_returns_openai_error() {
+    let mut app = test_app().await;
+    let logit_bias: serde_json::Map<_, _> =
+        (0..1025).map(|token_id| (token_id.to_string(), json!(1.0))).collect();
+    let response = app
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "Qwen/Qwen1.5-0.5B-Chat",
+                        "stream": false,
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "logit_bias": logit_bias
+                    })
+                    .to_string(),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+    assert_eq!(json["error"]["type"], "BadRequestError");
+    assert_eq!(
+        json["error"]["message"],
+        "Too many logit bias tokens: 1025. The max size is 1024."
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn non_stream_chat_returns_json_response() {
